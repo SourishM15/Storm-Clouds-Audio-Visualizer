@@ -1,0 +1,342 @@
+/** 
+ * Storm Clouds Audio-Visualizer
+ * A dynamic storm scene that reacts to live audio input from the microphone.
+ * Features:
+ * - Rain intensity and wind turbulence scale with audio amplitude and midrange energy.
+ * - Lightning strikes triggered by peaks in amplitude and high-frequency energy, with branching bolts.
+ * - Thunder effect with a delay after lightning, influenced by bass energy for a rumble effect.
+ * - Layered clouds that brighten and become more turbulent with storm intensity.
+ * - Raindrop splashes when hitting the ground, scaling with intensity.
+ * - On-canvas debug bars showing bass/mid/treble levels from the FFT analysis.
+ * 
+ * Uses p5.js for graphics and audio input/analysis.
+ * Author: Sourish Mukherji
+ * 
+*/
+
+let mic;
+let fft;
+let drops = [];
+let prevLevel = 0;
+let flash = 0;
+let bolt = null;
+let branches = [];
+let t = 0;
+let smoothLevel = 0;
+let thunderTimer = 0;
+let thunderStrength = 0;
+let shake = 0;
+let splashes = [];
+
+// FFT band energies (0..255)
+let bass = 0, mid = 0, treble = 0;
+
+// Setup canvas and audio input; initialize FFT and start with some raindrops
+function setup() {
+  createCanvas(700, 450);
+
+  mic = new p5.AudioIn();
+  mic.start();
+
+  // FFT: smoothing + number of frequency bins
+  fft = new p5.FFT(0.8, 1024);
+  fft.setInput(mic);
+
+  // start with some rain drops (we'll add more when loud)
+  for (let i = 0; i < 200; i++) drops.push(makeDrop());
+}
+
+// Main draw loop: analyze audio, update storm elements, and render the scene
+function draw() {
+  // --- Amplitude (loudness) ---
+  let raw = mic.getLevel();
+  smoothLevel = lerp(smoothLevel, raw, 0.15); 
+  let intensity = constrain(map(smoothLevel, 0, 0.2, 0, 1), 0, 1);
+
+  // --- Frequency (FFT) ---
+  fft.analyze();
+  bass = fft.getEnergy("bass");
+  mid = fft.getEnergy("mid");
+  treble = fft.getEnergy("treble");
+
+  let bassN = bass / 255.0;
+  let midN = mid / 255.0;
+  let trebleN = treble / 255.0;
+
+  // Thunder countdown: delay between lightning and "thunder" effect
+  if (thunderTimer > 0) {
+    thunderTimer--;
+    if (thunderTimer === 0) {
+      thunderStrength = 1.0;
+
+      // Base shake from intensity + extra from bass (low-frequency rumble)
+      shake = max(shake, 10 + 25 * intensity + 18 * bassN);
+    }
+  }
+
+  // Bass adds a continuous rumble (even without a recent strike)
+  thunderStrength = max(thunderStrength, bassN * 0.6);
+
+  // decay effects
+  thunderStrength = max(0, thunderStrength - 0.06);
+  shake = max(0, shake - 1.2);
+
+  push();
+  // camera shake (bass + thunder)
+  if (shake > 0) {
+    translate(random(-shake, shake) * 0.15, random(-shake, shake) * 0.15);
+  }
+
+  background(10, 15, 25);
+
+  // wind: time-varying (noise) + intensity; mid adds extra turbulence
+  let wind = map(noise(t), 0, 1, -1, 1) * (2 + 6 * intensity + 3 * midN);
+
+  drawClouds(intensity, wind, thunderStrength);
+
+  // rain amount scales with intensity + a bit with midrange energy
+  let targetCount = floor(120 + 980 * intensity + 400 * midN);
+  while (drops.length < targetCount) drops.push(makeDrop());
+  while (drops.length > targetCount && drops.length > 100) drops.pop();
+
+  updateRain(intensity, wind, midN);
+  updateSplashes(intensity);
+
+  // Simple onset/peak detection using change in smoothed amplitude
+  let delta = smoothLevel - prevLevel;
+  let peak = (delta > 0.03 && smoothLevel > 0.06);
+
+  // Lightning chance: base randomness + intensity + treble (high-frequency "crackle")
+  let randomStrike = random() < (0.001 + 0.012 * intensity + 0.02 * trebleN);
+
+  if ((peak || randomStrike) && flash <= 0) {
+    triggerLightning(intensity, trebleN);
+  }
+
+  drawLightning();
+
+  // thunder glow overlay (bass-driven rumble shows up here too)
+  if (thunderStrength > 0) {
+    noStroke();
+    fill(255, 255, 255, 30 * thunderStrength);
+    rect(0, 0, width, height);
+  }
+
+  // FFT debug bars (bass/mid/treble) - helps show that frequency analysis is working
+  drawFFTDebug(bassN, midN, trebleN);
+
+  prevLevel = smoothLevel;
+
+  // time advances; midrange adds extra "motion energy"
+  t += 0.01 + 0.03 * intensity + 0.02 * midN;
+
+  pop();
+}
+
+// Create a new raindrop with random position, depth (z), and length
+function makeDrop() {
+  return {
+    x: random(width),
+    y: random(-height, height),
+    z: random(0.5, 1.5),
+    len: random(8, 16)
+  };
+}
+
+// Update raindrop positions based on speed (which scales with intensity and midrange energy) and wind
+// When drops hit the ground, create splashes with a chance that scales with intensity.
+function updateRain(intensity, wind, midN) {
+  stroke(180, 200, 255, 180);
+  strokeWeight(1);
+
+  for (let d of drops) {
+    // mid adds some extra speed/energy to rain movement
+    let speed = (8 + 20 * intensity + 6 * midN) * d.z;
+    d.y += speed;
+    d.x += wind * 0.2 * d.z;
+
+    line(d.x, d.y, d.x - wind * 0.5, d.y - d.len);
+
+    // when a drop hits the ground, make a splash (prob scales with intensity)
+    if (d.y > height + 20) {
+      if (random() < 0.25 + 0.5 * intensity) {
+        splashes.push(makeSplash(d.x, height - 2, intensity));
+      }
+      d.y = random(-200, -20);
+      d.x = random(width);
+    }
+
+    // wrap horizontally so wind can push rain offscreen
+    if (d.x < -50) d.x = width + 50;
+    if (d.x > width + 50) d.x = -50;
+  }
+}
+
+// Splash effect when raindrop hits the ground
+// Each splash has a position, radius (which expands), and life (which determines how long it lasts)
+function makeSplash(x, y, intensity) {
+  return {
+    x,
+    y,
+    r: random(2, 5),
+    life: random(10, 18) + 10 * intensity
+  };
+}
+
+// Update and draw splashes; they expand and fade out over time
+// Each splash is drawn as an ellipse that grows in size and fades out (life decreases) until it disappears
+function updateSplashes(intensity) {
+  noFill();
+  stroke(190, 210, 255, 110);
+  strokeWeight(1);
+
+  for (let i = splashes.length - 1; i >= 0; i--) {
+    let s = splashes[i];
+    ellipse(s.x, s.y, s.r * 2, s.r);
+    s.r += 1.6 + 1.8 * intensity;
+    s.life -= 1;
+
+    if (s.life <= 0) splashes.splice(i, 1);
+  }
+}
+
+// Draw layered clouds; density and brightness increase with intensity and thunder strength
+function drawClouds(intensity, wind, thunderStrength) {
+  noStroke();
+  let layers = 3;
+
+  // Each layer is drawn as a series of rectangles with heights based on Perlin noise.
+  for (let k = 0; k < layers; k++) {
+    let yBase = 40 + k * 65;
+    for (let x = 0; x < width; x += 12) {
+      let n = noise(x * 0.01, k * 0.5, t * 0.6);
+      let h = map(n, 0, 1, 10, 90) * (0.4 + 1.2 * intensity);
+
+      // Thunder makes clouds brighter and more ominous (flash effect lingers in clouds)
+      let a = 70 + 40 * thunderStrength;
+      fill(
+        30 + 20 * thunderStrength,
+        35 + 20 * thunderStrength,
+        50 + 30 * thunderStrength,
+        a
+      );
+
+      rect(x + wind * k * 0.2, yBase, 12, h);
+    }
+  }
+
+  // fog that lifts as intensity increases (more storm = less "flat" fog)
+  let fog = map(intensity, 0, 0.3, 120, 0, true);
+  fill(20, 25, 35, fog);
+  rect(0, 0, width, height);
+}
+
+// Trigger a lightning strike: create a main bolt with random segments and possible branches;
+// Set flash for screen effect and thunder timer based on how far the bolt reaches
+function triggerLightning(intensity, trebleN) {
+  flash = 255;
+  bolt = [];
+  branches = [];
+
+  // Start point of the bolt: random x across the canvas width
+  let x = random(width * 0.2, width * 0.8);
+  let y = 0;
+  bolt.push({x, y});
+
+  // Main bolt segments: random number of segments, with random horizontal deviation and downward movement
+  let segments = floor(random(8, 14));
+  for (let i = 0; i < segments; i++) {
+    x += random(-30, 30);
+    y += random(20, 45);
+    bolt.push({x, y});
+
+    if (y > height * 0.85) break;
+
+    // Treble increases branching (high-frequency "electric crackle")
+    let branchChance = 0.12 + 0.25 * intensity + 0.35 * trebleN;
+    if (random() < branchChance && i > 2) branches.push(makeBranch(x, y));
+  }
+
+  // Thunder delay based on how far the bolt reaches (simple distance proxy)
+  let endY = bolt[bolt.length - 1].y;
+  let distance = map(endY, 0, height, 1.2, 0.25);
+  thunderTimer = floor(30 * distance);
+}
+
+// Create a branching bolt starting from (x, y); branches off the main bolt with random segments
+function makeBranch(x, y) {
+  let pts = [{x, y}];
+
+  let bx = x;
+  let by = y;
+  let segs = floor(random(3, 7));
+  for (let i = 0; i < segs; i++) {
+    bx += random(-35, 35);
+    by += random(15, 35);
+    pts.push({x: bx, y: by});
+    if (by > height * 0.9) break;
+  }
+  return pts;
+}
+
+// Draw the main bolt and branches with varying stroke weights and colors for a glowing effect
+function drawLightning() {
+  if (flash > 0) {
+    noStroke();
+    let flicker = (random() < 0.35) ? random(40, 120) : 0;
+    fill(255, min(255, flash + flicker));
+    rect(0, 0, width, height);
+    flash -= 22;
+  }
+
+  // Main bolt
+  if (bolt) {
+    stroke(200, 220, 255, 80);
+    strokeWeight(6);
+    noFill();
+    drawBoltShape(bolt);
+
+    stroke(255, 255, 255, 230);
+    strokeWeight(2);
+    drawBoltShape(bolt);
+
+    for (let b of branches) {
+      stroke(220, 235, 255, 140);
+      strokeWeight(2);
+      drawBoltShape(b);
+    }
+
+    if (flash <= 0) {
+      bolt = null;
+      branches = [];
+    }
+  }
+}
+
+// Helper to draw a bolt or branch given an array of points
+function drawBoltShape(points) {
+  beginShape();
+  for (let p of points) vertex(p.x, p.y);
+  endShape();
+}
+
+// Small on-canvas frequency indicator (helps show that frequency analysis is working)
+// Draws three horizontal bars for bass, mid, and treble levels (0..1), with labels
+function drawFFTDebug(bassN, midN, trebleN) {
+  noStroke();
+  fill(255, 80);
+  rect(10, height - 40, 80, 8);
+  rect(10, height - 28, 80, 8);
+  rect(10, height - 16, 80, 8);
+
+  fill(255);
+  rect(10, height - 40, 80 * bassN, 8);
+  rect(10, height - 28, 80 * midN, 8);
+  rect(10, height - 16, 80 * trebleN, 8);
+
+  fill(255, 140);
+  textSize(10);
+  text("B", 95, height - 33);
+  text("M", 95, height - 21);
+  text("T", 95, height - 9);
+}
